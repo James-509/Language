@@ -1,0 +1,6 @@
+visualize_weights.py
+runs/
+data/
+checkpoints/
+.vscode/
+__pycache__/
