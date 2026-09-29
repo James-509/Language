@@ -7,7 +7,7 @@ tensor plus integer label tensors plus the label vocabularies. Loading this
 cache at training time avoids re-rasterizing glyphs on every epoch.
 
 Usage:
-    python prerender_cache.py --csv data/labels_simplified.csv  --out data/cache_simplified.pt
+    python prerender_cache.py --csv data/labels.csv --out data/cache_all.pt
     python prerender_cache.py --csv data/labels_traditional.csv --out data/cache_traditional.pt
 
 Cache contents (torch.save'd dict):
@@ -25,9 +25,10 @@ import argparse
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
-from chinese_char_dataset import ChineseCharDataset, render_char
+from chinese_char_dataset import ChineseCharDataset, render_char, _find_default_fonts
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -44,9 +45,7 @@ def build_cache(csv_path, image_size, font_path, invert=False):
     for i in range(n):
         row = ds.rows[i]
         img = render_char(row["char"], font_path, image_size=image_size, invert=invert)
-        images[i, 0] = torch.from_numpy(
-            __import__("numpy").array(img, dtype="uint8")
-        )
+        images[i, 0] = torch.from_numpy(np.array(img, dtype="uint8"))
         tone_labels[i] = ds.tone_to_idx[row["tone"]]
         pinyin_labels[i] = ds.pinyin_to_idx[row["pinyin"]]
         chars.append(row["char"])
@@ -68,19 +67,22 @@ def build_cache(csv_path, image_size, font_path, invert=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--csv", default=str(DATA_DIR / "labels_simplified.csv"), help="Input metadata CSV")
-    parser.add_argument("--out", default=str(DATA_DIR / "cache_simplified.pt"), help="Output cache .pt path")
+    parser.add_argument("--csv", default=str(DATA_DIR / "labels.csv"), help="Input metadata CSV")
+    parser.add_argument("--out", default=str(DATA_DIR / "cache_all.pt"), help="Output cache .pt path")
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument(
         "--font",
-        default="/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        help="Font file to render with",
+        default=None,
+        help="Font file to render with (default: auto-detect a CJK-capable font for your OS)",
     )
     parser.add_argument("--invert", action="store_true", help="White-on-black instead of black-on-white")
     args = parser.parse_args()
 
+    font_path = args.font or _find_default_fonts()[0]
+    print(f"Using font: {font_path}")
+
     print(f"Building cache from {args.csv} ...")
-    cache = build_cache(args.csv, args.image_size, args.font, invert=args.invert)
+    cache = build_cache(args.csv, args.image_size, font_path, invert=args.invert)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     torch.save(cache, args.out)
 

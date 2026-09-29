@@ -6,16 +6,24 @@ Trains a CNN with two output heads on the pre-rendered character cache:
   - tone head:   classifies the tone (1-5, 5=neutral), 5 classes
 
 Usage:
-    python train.py --cache data/cache_simplified.pt --epochs 20
+    python train.py --epochs 20
     python train.py --cache data/cache_traditional.pt --epochs 20 --batch-size 128
 
 Progress is logged to TensorBoard by default (loss, tone/pinyin/both
-accuracy, learning rate, for train and val). View it with:
+accuracy, learning rate, weight/gradient histograms, for train and val).
+View it with:
     tensorboard --logdir runs
-Disable with --no-tensorboard.
+Disable with --no-tensorboard / --no-weight-histograms.
+
+Training images are augmented by default with slight random rotation and
+rescaling (torchvision transforms.RandomAffine) to improve generalization;
+validation images are never augmented, so val accuracy always reflects
+performance on clean, canonical glyphs. Tune with --augment-degrees /
+--augment-scale-min / --augment-scale-max, or disable with --no-augment.
 
 The cache's own train/val split is random per run unless --seed is fixed.
-Checkpoints (best val accuracy) are saved to --out.
+Checkpoints (best val accuracy) are saved to --out, and won't overwrite an
+existing checkpoint with a worse one.
 """
 
 import argparse
@@ -25,8 +33,9 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
 
 from cached_dataset import CachedCharDataset
 
@@ -117,7 +126,7 @@ def run_epoch(model, loader, device, optimizer=None, pinyin_loss_weight=1.0):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cache", default=str(DATA_DIR / "cache_simplified.pt"),
+    parser.add_argument("--cache", default=str(DATA_DIR / "cache_all.pt"),
                          help="Path to a prerender_cache.py .pt file")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -134,10 +143,19 @@ def main():
     parser.add_argument("--log-dir", default=str(Path(__file__).resolve().parent / "runs"),
                          help="TensorBoard log directory (a timestamped subfolder is created inside it)")
     parser.add_argument("--run-name", default=None,
-                         help="Name for this run's TensorBoard subfolder (default: cache name + timestamp)")
+                         help="Name for this run's TensorBoard subfolder / checkpoint stem "
+                              "(default: cache name + timestamp)")
     parser.add_argument("--no-tensorboard", action="store_true", help="Disable TensorBoard logging")
     parser.add_argument("--no-weight-histograms", action="store_true",
                          help="Skip logging weight/gradient histograms (they add some overhead per epoch)")
+    parser.add_argument("--no-augment", action="store_true",
+                         help="Disable data augmentation (rotation + rescaling) on the training split")
+    parser.add_argument("--augment-degrees", type=float, default=10.0,
+                         help="Max +/- rotation angle in degrees for training augmentation")
+    parser.add_argument("--augment-scale-min", type=float, default=0.9,
+                         help="Min random scale factor for training augmentation")
+    parser.add_argument("--augment-scale-max", type=float, default=1.1,
+                         help="Max random scale factor for training augmentation")
     args = parser.parse_args()
 
     if args.out is None:
@@ -158,14 +176,37 @@ def main():
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    full_ds = CachedCharDataset(args.cache)
-    n_val = int(len(full_ds) * args.val_fraction)
-    n_train = len(full_ds) - n_val
-    train_ds, val_ds = random_split(
-        full_ds, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed)
-    )
+    # Load the cache ONCE, then build two thin dataset views over the same
+    # underlying tensors (one with augmentation, one without) so train and
+    # val can have different transforms without duplicating the image data
+    # in memory or reading the file from disk twice.
+    raw_cache = torch.load(args.cache, weights_only=False)
+
+    train_transform = None
+    if not args.no_augment:
+        train_transform = transforms.RandomAffine(
+            degrees=args.augment_degrees,
+            scale=(args.augment_scale_min, args.augment_scale_max),
+            fill=1.0,  # background is white (1.0) after ToTensor-style scaling; avoid black corners
+        )
+        print(f"Augmenting training split with: RandomAffine(degrees={args.augment_degrees}, "
+              f"scale=({args.augment_scale_min}, {args.augment_scale_max}))")
+
+    train_view = CachedCharDataset(cache_dict=raw_cache, transform=train_transform)
+    val_view = CachedCharDataset(cache_dict=raw_cache, transform=None)
+    # val_view has no transform on purpose, so val accuracy reflects
+    # performance on clean, canonical glyphs.
+
+    n = len(train_view)
+    n_val = int(n * args.val_fraction)
+    n_train = n - n_val
+    perm = torch.randperm(n, generator=torch.Generator().manual_seed(args.seed)).tolist()
+    train_indices, val_indices = perm[:n_train], perm[n_train:]
+
+    train_ds = Subset(train_view, train_indices)
+    val_ds = Subset(val_view, val_indices)
     print(f"Train: {n_train}  Val: {n_val}")
-    print(f"Tone classes: {len(full_ds.tone_classes)}  Pinyin classes: {len(full_ds.pinyin_classes)}")
+    print(f"Tone classes: {len(train_view.tone_classes)}  Pinyin classes: {len(train_view.pinyin_classes)}")
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -177,9 +218,9 @@ def main():
     )
 
     model = GlyphNet(
-        num_tones=len(full_ds.tone_classes),
-        num_pinyin=len(full_ds.pinyin_classes),
-        image_size=full_ds.image_size,
+        num_tones=len(train_view.tone_classes),
+        num_pinyin=len(train_view.pinyin_classes),
+        image_size=train_view.image_size,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -243,9 +284,9 @@ def main():
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
-                    "tone_classes": full_ds.tone_classes,
-                    "pinyin_classes": full_ds.pinyin_classes,
-                    "image_size": full_ds.image_size,
+                    "tone_classes": train_view.tone_classes,
+                    "pinyin_classes": train_view.pinyin_classes,
+                    "image_size": train_view.image_size,
                     "epoch": epoch,
                     "val_both_acc": best_both_acc,
                 },

@@ -4,3 +4,6 @@ data/
 checkpoints/
 .vscode/
 __pycache__/
+compare_runs.py
+best_model.pt
+weights_grid.png

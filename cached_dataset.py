@@ -8,7 +8,7 @@ many times (many epochs).
 
 Usage:
     from cached_dataset import CachedCharDataset
-    ds = CachedCharDataset("cache_simplified.pt")
+    ds = CachedCharDataset("data/cache_all.pt")
     image, tone_label, pinyin_label = ds[0]   # image is float32 [1, H, W] in [0, 1]
 """
 
@@ -17,15 +17,26 @@ from torch.utils.data import Dataset
 
 
 class CachedCharDataset(Dataset):
-    def __init__(self, cache_path, transform=None):
-        cache = torch.load(cache_path, weights_only=False)
-        self.images = cache["images"]  # uint8 [N, 1, H, W]
-        self.tone_labels = cache["tone_labels"]  # int64 [N]
-        self.pinyin_labels = cache["pinyin_labels"]  # int64 [N]
-        self.tone_classes = cache["tone_classes"]
-        self.pinyin_classes = cache["pinyin_classes"]
-        self.chars = cache["chars"]
-        self.image_size = cache["image_size"]
+    def __init__(self, cache_path=None, cache_dict=None, transform=None):
+        """
+        Provide either cache_path (loads the .pt file) or a pre-loaded
+        cache_dict (as returned by torch.load on that file). Passing an
+        already-loaded cache_dict lets you build two views of the same data
+        with different transforms (e.g. train vs val) without loading the
+        file from disk twice or duplicating the image tensor in memory --
+        see train.py for how this is used to augment only the train split.
+        """
+        if cache_dict is None:
+            if cache_path is None:
+                raise ValueError("Provide either cache_path or cache_dict")
+            cache_dict = torch.load(cache_path, weights_only=False)
+        self.images = cache_dict["images"]  # uint8 [N, 1, H, W]
+        self.tone_labels = cache_dict["tone_labels"]  # int64 [N]
+        self.pinyin_labels = cache_dict["pinyin_labels"]  # int64 [N]
+        self.tone_classes = cache_dict["tone_classes"]
+        self.pinyin_classes = cache_dict["pinyin_classes"]
+        self.chars = cache_dict["chars"]
+        self.image_size = cache_dict["image_size"]
 
         self.tone_to_idx = {t: i for i, t in enumerate(self.tone_classes)}
         self.idx_to_tone = {i: t for t, i in self.tone_to_idx.items()}
@@ -55,7 +66,7 @@ if __name__ == "__main__":
     import sys
     from pathlib import Path
 
-    default_cache = Path(__file__).resolve().parent / "data" / "cache_simplified.pt"
+    default_cache = Path(__file__).resolve().parent / "data" / "cache_all.pt"
     cache_path = sys.argv[1] if len(sys.argv) > 1 else str(default_cache)
     ds = CachedCharDataset(cache_path)
     print(f"Dataset size: {len(ds)}")
