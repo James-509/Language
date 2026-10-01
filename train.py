@@ -237,6 +237,7 @@ def main():
         print(f"  view with: tensorboard --logdir {args.log_dir}")
 
     best_both_acc = -1.0
+    best_epoch = None
     if Path(args.out).exists():
         try:
             existing = torch.load(args.out, weights_only=False)
@@ -268,10 +269,22 @@ def main():
         )
 
         if writer is not None:
-            writer.add_scalars("loss", {"train": train_stats["loss"], "val": val_stats["loss"]}, epoch)
-            writer.add_scalars("tone_acc", {"train": train_stats["tone_acc"], "val": val_stats["tone_acc"]}, epoch)
-            writer.add_scalars("pinyin_acc", {"train": train_stats["pinyin_acc"], "val": val_stats["pinyin_acc"]}, epoch)
-            writer.add_scalars("both_acc", {"train": train_stats["both_acc"], "val": val_stats["both_acc"]}, epoch)
+            # Plain add_scalar with "metric/split" tag names, NOT add_scalars:
+            # add_scalars creates a separate nested sub-run per split (e.g.
+            # "both_acc/train", "both_acc/val" as distinct "runs" in the UI),
+            # which multiplies fast across many training sessions and can make
+            # TensorBoard's main (unpinned) view choke on run-list size. This
+            # pattern keeps everything under ONE run per session; TensorBoard
+            # still groups "loss/train" and "loss/val" onto the same chart
+            # automatically because they share everything before the last "/".
+            writer.add_scalar("loss/train", train_stats["loss"], epoch)
+            writer.add_scalar("loss/val", val_stats["loss"], epoch)
+            writer.add_scalar("tone_acc/train", train_stats["tone_acc"], epoch)
+            writer.add_scalar("tone_acc/val", val_stats["tone_acc"], epoch)
+            writer.add_scalar("pinyin_acc/train", train_stats["pinyin_acc"], epoch)
+            writer.add_scalar("pinyin_acc/val", val_stats["pinyin_acc"], epoch)
+            writer.add_scalar("both_acc/train", train_stats["both_acc"], epoch)
+            writer.add_scalar("both_acc/val", val_stats["both_acc"], epoch)
             writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
             if not args.no_weight_histograms:
                 for name, param in model.named_parameters():
@@ -281,6 +294,7 @@ def main():
 
         if val_stats["both_acc"] > best_both_acc:
             best_both_acc = val_stats["both_acc"]
+            best_epoch = epoch
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -288,6 +302,7 @@ def main():
                     "pinyin_classes": train_view.pinyin_classes,
                     "image_size": train_view.image_size,
                     "epoch": epoch,
+                    "total_epochs": args.epochs,
                     "val_both_acc": best_both_acc,
                 },
                 args.out,
@@ -297,7 +312,36 @@ def main():
     if writer is not None:
         writer.close()
 
-    print(f"Done. Best val both-correct accuracy: {best_both_acc*100:.1f}% (checkpoint: {args.out})")
+    # "Best" is picked by raw per-epoch val both_acc, which is a noisy metric
+    # on a small validation set (it requires tone AND pinyin correct on the
+    # SAME sample). A random high spike early on can "win" and never get
+    # beaten again even while the real underlying trend keeps improving --
+    # so the best checkpoint's epoch is NOT necessarily close to the last
+    # epoch. Always also save the final epoch's state so you have both to
+    # compare, instead of only ever seeing whichever happened to spike.
+    last_path = str(Path(args.out).with_name(Path(args.out).stem + "_last" + Path(args.out).suffix))
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "tone_classes": train_view.tone_classes,
+            "pinyin_classes": train_view.pinyin_classes,
+            "image_size": train_view.image_size,
+            "epoch": args.epochs,
+            "total_epochs": args.epochs,
+            "val_both_acc": val_stats["both_acc"],
+        },
+        last_path,
+    )
+
+    print(f"Done. Best val both-correct accuracy: {best_both_acc*100:.1f}% at epoch {best_epoch}/{args.epochs} "
+          f"(checkpoint: {args.out})")
+    print(f"Final epoch ({args.epochs}) val both-correct accuracy: {val_stats['both_acc']*100:.1f}% "
+          f"(checkpoint: {last_path})")
+    if best_both_acc > val_stats["both_acc"]:
+        print("Note: the 'best' checkpoint came from an earlier epoch than the final one -- "
+              "this is common with a noisy metric like both_acc on a small val set, and doesn't "
+              "necessarily mean training got worse. Compare both checkpoints, and consider "
+              "evaluating with evaluate.py on a larger held-out set if this gap looks large.")
 
 
 if __name__ == "__main__":
